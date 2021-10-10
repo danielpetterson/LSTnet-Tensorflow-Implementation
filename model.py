@@ -1,5 +1,7 @@
+
 # Import libraries
 import numpy as np
+import matplotlib.pyplot as plt
 import tensorflow as tf
 from tensorflow.keras import backend as K
 from tensorflow.keras.models import Model
@@ -7,7 +9,7 @@ from tensorflow.keras.layers import Input, Conv2D, Dense, Flatten, GRU, Dropout,
 import argparse
 
 ### Default arguments from original Pytorch implementation--------------------------------------
-parser = argparse.ArgumentParser(description='PyTorch Time series forecasting')
+parser = argparse.ArgumentParser(description='Tensorflow Time series forecasting')
 parser.add_argument('--data', type=str,
                     help='location of the data file')
 parser.add_argument('--model', type=str, default='LSTNet',
@@ -24,9 +26,9 @@ parser.add_argument('--highway_window', type=int, default=24,
                     help='The window size of the highway component')
 parser.add_argument('--clip', type=float, default=10.,
                     help='gradient clipping')
-parser.add_argument('--epochs', type=int, default=100,
+parser.add_argument('--epochs', type=int, default=2,
                     help='upper epoch limit')
-parser.add_argument('--batch_size', type=int, default=128, metavar='N',
+parser.add_argument('--batch_size', type=int, default=32, metavar='N',
                     help='batch size')
 parser.add_argument('--dropout', type=float, default=0.2,
                     help='dropout applied to layers (0 = no dropout)')
@@ -37,7 +39,7 @@ parser.add_argument('--log_interval', type=int, default=2000, metavar='N',
                     help='report interval')
 parser.add_argument('--save', type=str,  default='model/model.pt',
                     help='path to save the final model')
-parser.add_argument('--optim', type=str, default='adam')
+parser.add_argument('--optim', type=str, default='SGD')
 parser.add_argument('--lr', type=float, default=0.001)
 parser.add_argument('--horizon', type=int, default=12)
 parser.add_argument('--skip', type=float, default=24)
@@ -49,6 +51,7 @@ args = parser.parse_args()
 ###-----------------------------------------------------------------------------------
 ### Layers to transform data for skipGRU
 ###-----------------------------------------------------------------------------------
+
 class PreSkipTrans(tf.keras.layers.Layer):
     def __init__(self, pt, skip, **kwargs):
         #
@@ -147,72 +150,107 @@ class PostSkipTrans(tf.keras.layers.Layer):
         return tf.TransformShape(shape)
 
 ###---------------------------------------------------------------------------
+class PreCNNReshape(tf.keras.layers.Layer):
+    def __init__(self):
+        super(PreCNNReshape, self).__init__()
+      
+    def build(self, input_shapes):
+        return
+      
+    def call(self, inputs):
+        print("preLayer dims", tf.shape(inputs))
+        result = tf.reshape(inputs, (-1, tf.shape(inputs)[1],tf.shape(inputs)[2], 1))
+        print("preLayer dims result", result)
+        return result
+
+class PostCNNReshape(tf.keras.layers.Layer):
+    def __init__(self):
+        super(PostCNNReshape, self).__init__()
+      
+    def build(self, input_shapes):
+        return
+      
+    def call(self, inputs):
+        print("postLayer dims", tf.shape(inputs))
+        result = tf.reshape(inputs, (tf.shape(inputs)[1],tf.shape(inputs)[3]))
+        print("postLayer dims result", result)
+        return result
+
 
 class Model(tf.keras.Model):
 
-  def __init__(self, args, data):
+  def __init__(self, args, input_shape):#, data):
     super(Model, self).__init__()
-    self.data = data
-    self.P = args.window
-    self.hidR = args.hidRNN
-    self.hidC = args.hidCNN
-    self.hidS = args.hidSkip
-    self.Ck = args.CNN_kernel
+    self.m = 862#data.m
+    self.window = args.window
+    self.hidRNN = args.hidRNN
+    self.hidCNN = args.hidCNN
+    self.hidSkip = args.hidSkip
+    self.CNN_kernel = args.CNN_kernel
     self.skip = args.skip
-    self.pt = (self.P - self.Ck)/self.skip
+    self.pt = (self.window - self.CNN_kernel)/self.skip
     self.hw = args.highway_window
-    self.conv1 = Conv2D(1, self.hidC, kernel_size = (self.Ck, self.data.size[1]))
-    self.GRU1 = GRU(self.hidC, self.hidR)
-    self.dropout = Dropout(p = args.dropout)
+    self.inputshape = input_shape
+    self.reshape1 = PreCNNReshape()
+    self.conv1 = Conv2D(self.hidCNN, kernel_size = (self.CNN_kernel, self.m))
+    self.relu1 = tf.keras.layers.ReLU()
+    self.dropout1 = Dropout(rate = args.dropout)
+    self.reshape2 = PostCNNReshape()
+
+    self.gru1 = GRU(self.hidRNN, activation="relu", return_sequences = False, return_state = True)
+    self.dropout2 = Dropout(rate = args.dropout)
+
     if (self.skip > 0):
-        self.GRUskip = GRU(self.hidC, self.hidS)
-        self.linear1 = Dense(self.hidR + self.skip * self.hidS, self.data.size[1])
+        self.preskiptrans = PreSkipTrans(self.pt, int((self.window - self.CNN_kernel + 1) / self.pt))
+        self.GRUskip = GRU(self.hidSkip, activation="relu", return_sequences = False, return_state = True)
+        self.linear1 = Dense(self.m)
+        self.postskiptrans = PostSkipTrans(int((self.window - self.CNN_kernel + 1) / self.pt))
     else:
-        self.linear1 = Dense(self.hidR, self.data.size[1])
-    if (self.hw > 0):
-        self.highway = Dense(self.hw, 1)
-    self.output = None
-    if (args.output_fun == 'sigmoid'):
-        self.output = K.sigmoid
-    if (args.output_fun == 'tanh'):
-        self.output = K.tanh
+        self.linear1 = Dense(self.m)
+    # if (self.hw > 0):
+    #     self.highway = Dense(self.hw, 1)
+    # self.output = None
+    # if (args.output_fun == 'sigmoid'):
+    #     self.output = K.sigmoid
+    # if (args.output_fun == 'tanh'):
+    #     self.output = K.tanh
+    self.concat = Concatenate(axis=1)
+    self.flatten = Flatten()
+    self.dense_final = Dense(self.m)
 
+  def call(self, inputs):
+    # CNN layer
+    init = self.reshape1(inputs)
+    conv = self.conv1(init)
+    conv = self.relu1(conv)
+    conv = self.dropout1(conv)
+    conv = self.reshape2(conv)
 
-    def call(self, inputs):
-        # CNN layer
-        init = Input(shape = inputs.shape[1:])
-        conv = Conv2D(activation="relu")(init)
-        conv = Dropout()(conv)
-        conv = Reshape(K.int_shape(conv)[1], K.int_shape(conv)[3])
+    # GRU layer with Relu activation function
+    gru = self.gru1(conv)
+    gru = self.dropout2(gru)
 
-        # GRU layer with Relu activation function
-        gru = GRU(activation="relu", return_sequences = False, return_state = True)(conv)
-        gru = Dropout()(gru)
+    # SkipGRU layer with Relu activation function
+    if self.skip > 0:
+        skipgru = self.preskiptrans(conv)
+        _, skipgru = self.GRUskip(skipgru)
+        skipgru = self.postskiptrans([skipgru,init])
 
-        # SkipGRU layer with Relu activation function
-        if self.skip > 0:
-        # Calculate the number of values to use which is equal to the window divided by how many time values to skip
-            pt = int(self.window / self.skip)
-            skipgru = PreSkipTrans(pt, int((self.window - self.CNNKernel + 1) / pt))(conv)
-            _, skipgru = GRU(init.SkipGRUUnits, activation="relu", return_sequences = False, return_state = True)(skipgru)
-            skipgru    = PostSkipTrans(int((self.window - self.CNNKernel + 1) / pt))([skipgru,init])
+    # Concatenate the outputs of GRU and SkipGRU
+    result = self.concat([gru,skipgru])
 
-        # Concatenate the outputs of GRU and SkipGRU
-        result = Concatenate(axis=1)([gru,skipgru])
-    
-        # Dense layer
-        Y = Flatten()(result)
-        Y = Dense(input.shape[1])(Y)
+    # Dense layer
+    Y = self.flatten(result)
+    Y = self.dense_final(Y)
 
-        return Y
+    return Y
 
 ### Data
 class data_utility(object):
     def __init__(self, filename, train_prop, val_prop, horizon, window):
         self.initdata = np.loadtxt(open(filename),delimiter=',')
         self.data = np.zeros(self.initdata.shape)
-        self.n = self.data.shape[0]
-        self.m = self.data.shape[1]
+        self.n, self.m = self.initdata.shape
         self.scale = np.ones(self.m)
         for i in range(self.m):
                 self.scale[i] = np.max(np.abs(self.initdata[:,i]))
@@ -240,8 +278,9 @@ class data_utility(object):
         self.val_set = set_lst[1]
         self.test_set = set_lst[2]
 
-if __name__ == "__main__":
+    
 
+if __name__ == "__main__":
     ### Traffic data
     ### A collection of 48 months (2015-2016) hourly data from the California Department
     ### of Transportation. The data describes the road occupancy rates (between 0 and 1) 
@@ -250,9 +289,33 @@ if __name__ == "__main__":
     horizon = 24
     fileloc = "/Users/danielpetterson/GitHub/LSTnet-Tensorflow-Implementation/data/traffic/traffic.txt"
     data = data_utility(fileloc, 0.6 ,0.2,horizon,window)
-    print(len(data.train_set))
+    # print(data.m)
+    # print(data.n)
 
-    # model = Model(args, data.train_set)
-    # print(model.summary)
-        
+    model = Model(args, data.train_set[0].shape)
+    print(data.train_set[0].shape)
+    print(data.train_set[1].shape)
+
+
+    model.compile(optimizer=args.optim, loss=tf.keras.losses.MeanSquaredError(), metrics=['accuracy', 'rmse'])
+
+    # model_history = []
+    # Fit model
+    history = model.fit(data.train_set[0], data.train_set[1], epochs=args.epochs, batch_size=args.batch_size, validation_data=(data.val_set[0], data.val_set[1]),verbose=2)
+    # model_history.append(history)
+    print(model.summary())
+    tf.keras.utils.plot_model(model, to_file='model.png', show_shapes=True)
+
+    # Plot loss of training and validation sets
+    plt.plot(history.history['loss'])
+    plt.plot(history.history['val_loss'])
+    plt.title('Baseline Configuration')
+    plt.ylabel('Loss')
+    plt.xlabel('Epoch')
+    plt.legend(['Training','Validation'])
+    plt.show()
+
+
+
+
 
