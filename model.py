@@ -5,7 +5,7 @@ import matplotlib.pyplot as plt
 import tensorflow as tf
 from tensorflow.keras import backend as K
 from tensorflow.keras.models import Model
-from tensorflow.keras.layers import Input, Conv2D, Dense, Flatten, GRU, Dropout, Reshape, Concatenate
+from tensorflow.keras.layers import Input, Conv2D, Dense, Flatten, GRU, Dropout, Concatenate
 import argparse
 
 ### Default arguments from original Pytorch implementation--------------------------------------
@@ -40,7 +40,7 @@ parser.add_argument('--log_interval', type=int, default=2000, metavar='N',
 parser.add_argument('--save', type=str,  default='model/model.pt',
                     help='path to save the final model')
 parser.add_argument('--optim', type=str, default='SGD')
-parser.add_argument('--lr', type=float, default=0.001)
+parser.add_argument('--learning_rate', type=float, default=0.001)
 parser.add_argument('--horizon', type=int, default=12)
 parser.add_argument('--skip', type=float, default=24)
 parser.add_argument('--hidSkip', type=int, default=5)
@@ -58,8 +58,8 @@ class PreSkipTrans(tf.keras.layers.Layer):
         # pt:   Number of different RNN cells = (window / skip)
         # skip: Number of points to skip
         #
-        self.pt   = pt
-        self.skip = skip
+        self.pt   = int(pt)
+        self.skip = int(skip)
         super(PreSkipTrans, self).__init__(**kwargs)
         
     def build(self, input_shape):
@@ -72,6 +72,7 @@ class PreSkipTrans(tf.keras.layers.Layer):
         # Get the batchsize which is tf.shape(x)[0] since inputs is either X or C which has the same
         # batchsize as the input to the model
         batchsize = tf.shape(x)[0]
+        
 
         # Get the shape of the input data
         input_shape = K.int_shape(x)
@@ -83,7 +84,8 @@ class PreSkipTrans(tf.keras.layers.Layer):
         # - Changing first dimension (batchsize) from None to the current batchsize
         # - Splitting second dimension into 2 dimensions
         output = tf.reshape(output, [batchsize, self.pt, self.skip, input_shape[2]])
-        
+
+
         # Permutate axis 1 and axis 2
         output = tf.transpose(output, perm=[0, 2, 1, 3])
         
@@ -96,6 +98,8 @@ class PreSkipTrans(tf.keras.layers.Layer):
         # Adjust the output shape by setting back the batch size dimension to None
         output_shape = tf.TensorShape([None]).concatenate(output.get_shape()[1:])
         
+        
+
         return output
     
     def compute_output_shape(self, input_shape):
@@ -140,7 +144,7 @@ class PostSkipTrans(tf.keras.layers.Layer):
         output_shape = tf.TensorShape([None]).concatenate(output.get_shape()[1:])
 
         return output
-
+    
     def compute_output_shape(self, input_shape):
         # Adjust shape[1] to be equal to shape[1] * skip in order for the 
         # shape to reflect the transformation that was done
@@ -154,34 +158,34 @@ class PreCNNReshape(tf.keras.layers.Layer):
     def __init__(self):
         super(PreCNNReshape, self).__init__()
       
-    def build(self, input_shapes):
-        return
+    def build(self, input_shape):
+        super(PreCNNReshape, self).build(input_shape)
       
     def call(self, inputs):
-        print("preLayer dims", tf.shape(inputs))
-        result = tf.reshape(inputs, (-1, tf.shape(inputs)[1],tf.shape(inputs)[2], 1))
-        print("preLayer dims result", result)
+        input_shape = K.int_shape(inputs)
+        print("preLayer input shape", input_shape)
+        result = tf.reshape(inputs, [-1,input_shape[1],input_shape[2],1])
+        print("preConvLayer output shape", result.shape)
         return result
 
 class PostCNNReshape(tf.keras.layers.Layer):
     def __init__(self):
         super(PostCNNReshape, self).__init__()
       
-    def build(self, input_shapes):
-        return
+    def build(self, input_shape):
+        super(PostCNNReshape, self).build(input_shape)
       
     def call(self, inputs):
-        print("postLayer dims", tf.shape(inputs))
-        result = tf.reshape(inputs, (tf.shape(inputs)[1],tf.shape(inputs)[3]))
-        print("postLayer dims result", result)
+        result = tf.squeeze(inputs,axis=2)
+        print("postLayer dims result", result.shape)
         return result
 
 
 class Model(tf.keras.Model):
 
-  def __init__(self, args, input_shape):#, data):
+  def __init__(self, args, in_shape):
     super(Model, self).__init__()
-    self.m = 862#data.m
+    self.m = in_shape[2]
     self.window = args.window
     self.hidRNN = args.hidRNN
     self.hidCNN = args.hidCNN
@@ -190,7 +194,8 @@ class Model(tf.keras.Model):
     self.skip = args.skip
     self.pt = (self.window - self.CNN_kernel)/self.skip
     self.hw = args.highway_window
-    self.inputshape = input_shape
+    self.inputshape = in_shape
+    self.input1 = Input(shape = in_shape)
     self.reshape1 = PreCNNReshape()
     self.conv1 = Conv2D(self.hidCNN, kernel_size = (self.CNN_kernel, self.m))
     self.relu1 = tf.keras.layers.ReLU()
@@ -207,6 +212,7 @@ class Model(tf.keras.Model):
         self.postskiptrans = PostSkipTrans(int((self.window - self.CNN_kernel + 1) / self.pt))
     else:
         self.linear1 = Dense(self.m)
+
     # if (self.hw > 0):
     #     self.highway = Dense(self.hw, 1)
     # self.output = None
@@ -220,8 +226,9 @@ class Model(tf.keras.Model):
 
   def call(self, inputs):
     # CNN layer
-    init = self.reshape1(inputs)
-    conv = self.conv1(init)
+    initial = self.input1(inputs)
+    conv = self.reshape1(initial)
+    conv = self.conv1(conv)
     conv = self.relu1(conv)
     conv = self.dropout1(conv)
     conv = self.reshape2(conv)
@@ -233,8 +240,8 @@ class Model(tf.keras.Model):
     # SkipGRU layer with Relu activation function
     if self.skip > 0:
         skipgru = self.preskiptrans(conv)
-        _, skipgru = self.GRUskip(skipgru)
-        skipgru = self.postskiptrans([skipgru,init])
+        skipgru = self.GRUskip(skipgru)
+        skipgru = self.postskiptrans([skipgru,initial])
 
     # Concatenate the outputs of GRU and SkipGRU
     result = self.concat([gru,skipgru])
@@ -293,11 +300,11 @@ if __name__ == "__main__":
     # print(data.n)
 
     model = Model(args, data.train_set[0].shape)
-    print(data.train_set[0].shape)
-    print(data.train_set[1].shape)
+    # print(data.train_set[0].shape)
+    # print(data.train_set[1].shape)
 
 
-    model.compile(optimizer=args.optim, loss=tf.keras.losses.MeanSquaredError(), metrics=['accuracy', 'rmse'])
+    model.compile(optimizer=args.optim, loss=tf.keras.losses.MeanSquaredError(), metrics=['rmse'])
 
     # model_history = []
     # Fit model
