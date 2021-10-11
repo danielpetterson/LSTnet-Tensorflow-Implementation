@@ -126,10 +126,7 @@ class PostSkipTrans(tf.keras.layers.Layer):
 	# - First one is the output of the SkipRNN layer which we will operate on
 	# - The second is the oiriginal model input tensor which we will use to get
 	#   the original batchsize
-        x, original_model_input = inputs
-
-        # Get the batchsize which is tf.shape(original_model_input)[0]
-        batchsize = tf.shape(original_model_input)[0]
+        x, batchsize = inputs
 
         # Get the shape of the input data
         input_shape = K.int_shape(x)
@@ -163,9 +160,7 @@ class PreCNNReshape(tf.keras.layers.Layer):
       
     def call(self, inputs):
         input_shape = K.int_shape(inputs)
-        print("preLayer input shape", input_shape)
         result = tf.reshape(inputs, [-1,input_shape[1],input_shape[2],1])
-        print("preConvLayer output shape", result.shape)
         return result
 
 class PostCNNReshape(tf.keras.layers.Layer):
@@ -177,7 +172,6 @@ class PostCNNReshape(tf.keras.layers.Layer):
       
     def call(self, inputs):
         result = tf.squeeze(inputs,axis=2)
-        print("postLayer dims result", result.shape)
         return result
 
 
@@ -186,6 +180,7 @@ class Model(tf.keras.Model):
   def __init__(self, args, in_shape):
     super(Model, self).__init__()
     self.m = in_shape[2]
+    self.batchsize = args.batch_size
     self.window = args.window
     self.hidRNN = args.hidRNN
     self.hidCNN = args.hidCNN
@@ -195,7 +190,6 @@ class Model(tf.keras.Model):
     self.pt = (self.window - self.CNN_kernel)/self.skip
     self.hw = args.highway_window
     self.inputshape = in_shape
-    self.input1 = Input(shape = in_shape)
     self.reshape1 = PreCNNReshape()
     self.conv1 = Conv2D(self.hidCNN, kernel_size = (self.CNN_kernel, self.m))
     self.relu1 = tf.keras.layers.ReLU()
@@ -213,8 +207,9 @@ class Model(tf.keras.Model):
     else:
         self.linear1 = Dense(self.m)
 
-    # if (self.hw > 0):
-    #     self.highway = Dense(self.hw, 1)
+    if (self.hw > 0):
+        self.highway1 = Flatten()
+        self.highway2 = Dense(1)
     # self.output = None
     # if (args.output_fun == 'sigmoid'):
     #     self.output = K.sigmoid
@@ -226,31 +221,37 @@ class Model(tf.keras.Model):
 
   def call(self, inputs):
     # CNN layer
-    initial = self.input1(inputs)
-    conv = self.reshape1(initial)
-    conv = self.conv1(conv)
+    init = self.reshape1(inputs)
+    conv = self.conv1(init)
     conv = self.relu1(conv)
     conv = self.dropout1(conv)
     conv = self.reshape2(conv)
 
     # GRU layer with Relu activation function
-    gru = self.gru1(conv)
+    _,gru = self.gru1(conv)
     gru = self.dropout2(gru)
 
     # SkipGRU layer with Relu activation function
     if self.skip > 0:
         skipgru = self.preskiptrans(conv)
-        skipgru = self.GRUskip(skipgru)
-        skipgru = self.postskiptrans([skipgru,initial])
+        _,skipgru = self.GRUskip(skipgru)
+        skipgru = self.postskiptrans([skipgru,self.batchsize])
 
     # Concatenate the outputs of GRU and SkipGRU
-    result = self.concat([gru,skipgru])
+    r = self.concat([gru,skipgru])
 
     # Dense layer
-    Y = self.flatten(result)
-    Y = self.dense_final(Y)
+    res = self.flatten(r)
+    res = self.dense_final(res)
 
-    return Y
+    if (self.hw > 0):
+            z = inputs[:, -int(self.hw):, :]
+            z = z.permute(0,2,1).contiguous().view(-1, self.hw)
+            z = self.highway(z)
+            z = z.view(-1,self.m)
+            res = res + z
+
+    return res
 
 ### Data
 class data_utility(object):
@@ -294,17 +295,13 @@ if __name__ == "__main__":
     ### measured by different sensors on San Francisco Bay area freeways.
     window = 24*7
     horizon = 24
-    fileloc = "/Users/danielpetterson/GitHub/LSTnet-Tensorflow-Implementation/data/traffic/traffic.txt"
+    fileloc = "/Users/danielpetterson/GitHub/LSTnet-Tensorflow-Implementation/data/traffic/traffic.txt.gz"
     data = data_utility(fileloc, 0.6 ,0.2,horizon,window)
-    # print(data.m)
-    # print(data.n)
 
     model = Model(args, data.train_set[0].shape)
-    # print(data.train_set[0].shape)
-    # print(data.train_set[1].shape)
 
 
-    model.compile(optimizer=args.optim, loss=tf.keras.losses.MeanSquaredError(), metrics=['rmse'])
+    model.compile(optimizer=args.optim, loss=tf.keras.losses.MeanSquaredError(), metrics=['accuracy'])
 
     # model_history = []
     # Fit model
