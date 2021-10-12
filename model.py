@@ -1,11 +1,12 @@
 
 # Import libraries
 import numpy as np
+import pandas as pd
 import matplotlib.pyplot as plt
 import tensorflow as tf
 from tensorflow.keras import backend as K
 from tensorflow.keras.models import Model
-from tensorflow.keras.layers import Input, Conv2D, Dense, Flatten, GRU, Dropout, Concatenate
+from tensorflow.keras.layers import Input, Conv2D, Dense, Flatten, GRU, Dropout, Concatenate, Add
 import argparse
 
 ### Default arguments from original Pytorch implementation--------------------------------------
@@ -28,7 +29,7 @@ parser.add_argument('--clip', type=float, default=10.,
                     help='gradient clipping')
 parser.add_argument('--epochs', type=int, default=2,
                     help='upper epoch limit')
-parser.add_argument('--batch_size', type=int, default=32, metavar='N',
+parser.add_argument('--batch_size', type=int, default=1, metavar='N',
                     help='batch size')
 parser.add_argument('--dropout', type=float, default=0.2,
                     help='dropout applied to layers (0 = no dropout)')
@@ -175,6 +176,47 @@ class PostCNNReshape(tf.keras.layers.Layer):
         return result
 
 
+class PreARReshape(tf.keras.layers.Layer):
+    def __init__(self, highway):
+        self.hw = int(highway)
+        super(PreARReshape, self).__init__()
+      
+    def build(self, input_shape):
+        super(PreARReshape, self).build(input_shape)
+      
+    def call(self, inputs):
+        inputs, inputshape = inputs
+        # print("Initial Input shape:",self.inputshape)
+        # print("Batchsize:",self.inputshape[0])
+        # print("Input shape:",input_shape)
+        out = inputs[:,-self.hw:,:]
+        out = tf.transpose(out,perm=[0,2,1])
+        result = tf.reshape(out,[inputshape[0]*K.int_shape(inputs)[2],self.hw])
+        return result
+
+    # def compute_output_shape(self, input_shape):
+    #     out_shape = tf.TensorShape.as_list(input_shape)
+    #     out_shape[1] = self.hw
+    #     return tf.TensorShape(shape)
+
+class PostARReshape(tf.keras.layers.Layer):
+    def __init__(self, m):
+      self.m = m
+      super(PostARReshape, self).__init__()
+      
+    def build(self, input_shape):
+      super(PostARReshape, self).build(input_shape)
+      
+    def call(self, inputs):
+      inputs, inputshape = inputs
+      result = tf.reshape(inputs, [inputshape[0], self.m])
+      return result
+
+    # def compute_output_shape(self, input_shape):
+    #   out_shape = tf.TensorShape.as_list(input_shape)
+    #   out_shape[1] = self.m
+    #   return tf.TensorShape(out_shape)
+
 class Model(tf.keras.Model):
 
   def __init__(self, args, in_shape):
@@ -195,10 +237,8 @@ class Model(tf.keras.Model):
     self.relu1 = tf.keras.layers.ReLU()
     self.dropout1 = Dropout(rate = args.dropout)
     self.reshape2 = PostCNNReshape()
-
     self.gru1 = GRU(self.hidRNN, activation="relu", return_sequences = False, return_state = True)
     self.dropout2 = Dropout(rate = args.dropout)
-
     if (self.skip > 0):
         self.preskiptrans = PreSkipTrans(self.pt, int((self.window - self.CNN_kernel + 1) / self.pt))
         self.GRUskip = GRU(self.hidSkip, activation="relu", return_sequences = False, return_state = True)
@@ -206,18 +246,15 @@ class Model(tf.keras.Model):
         self.postskiptrans = PostSkipTrans(int((self.window - self.CNN_kernel + 1) / self.pt))
     else:
         self.linear1 = Dense(self.m)
-
     if (self.hw > 0):
+        self.prearreshape = PreARReshape(self.hw)
         self.highway1 = Flatten()
         self.highway2 = Dense(1)
-    # self.output = None
-    # if (args.output_fun == 'sigmoid'):
-    #     self.output = K.sigmoid
-    # if (args.output_fun == 'tanh'):
-    #     self.output = K.tanh
+        self.postarreshape = PostARReshape(self.m)
     self.concat = Concatenate(axis=1)
     self.flatten = Flatten()
     self.dense_final = Dense(self.m)
+    self.sum = Add()
 
   def call(self, inputs):
     # CNN layer
@@ -243,20 +280,25 @@ class Model(tf.keras.Model):
     # Dense layer
     res = self.flatten(r)
     res = self.dense_final(res)
-
+    
+    # Highway
     if (self.hw > 0):
-            z = inputs[:, -int(self.hw):, :]
-            z = z.permute(0,2,1).contiguous().view(-1, self.hw)
-            z = self.highway(z)
-            z = z.view(-1,self.m)
-            res = res + z
+        z = self.prearreshape([inputs, tf.shape(inputs)])
+        z = self.highway1(z)
+        z = self.highway2(z)
+        z = self.postarreshape([z,tf.shape(inputs)])
+          
+    res = self.sum([res,z])
 
     return res
 
 ### Data
 class data_utility(object):
-    def __init__(self, filename, train_prop, val_prop, horizon, window):
-        self.initdata = np.loadtxt(open(filename),delimiter=',')
+    def __init__(self, filename, train_prop, val_prop, horizon, window, header=False):
+        if header == True:
+            self.initdata = pd.read_csv(filename, skiprows=1, delimiter=',').values
+        else:
+            self.initdata = pd.read_csv(filename, skiprows=0, delimiter=',').values
         self.data = np.zeros(self.initdata.shape)
         self.n, self.m = self.initdata.shape
         self.scale = np.ones(self.m)
@@ -286,6 +328,13 @@ class data_utility(object):
         self.val_set = set_lst[1]
         self.test_set = set_lst[2]
 
+def RSE(y_true, y_pred):
+    sq_error = K.square(y_true - y_pred)
+    mse = K.mean(sq_error)
+    RSE = K.sqrt(mse)/K.std(y_true)
+    return RSE
+
+RMSE = tf.keras.metrics.RootMeanSquaredError()
     
 
 if __name__ == "__main__":
@@ -295,26 +344,28 @@ if __name__ == "__main__":
     ### measured by different sensors on San Francisco Bay area freeways.
     window = 24*7
     horizon = 24
-    fileloc = "/Users/danielpetterson/GitHub/LSTnet-Tensorflow-Implementation/data/traffic/traffic.txt.gz"
-    data = data_utility(fileloc, 0.6 ,0.2,horizon,window)
+    #fileloc = "/Users/danielpetterson/GitHub/LSTnet-Tensorflow-Implementation/data/traffic/traffic.txt"
+    fileloc = "/Users/danielpetterson/GitHub/LSTnet-Tensorflow-Implementation/data/energy_dataset.csv"
+    data = data_utility(fileloc,0.01,0.01,horizon,window,True)
 
     model = Model(args, data.train_set[0].shape)
 
-
-    model.compile(optimizer=args.optim, loss=tf.keras.losses.MeanSquaredError(), metrics=['accuracy'])
+    ## Use SGD as optimiser in place of Adam due to issues with tensorflow_macos
+    model.compile(optimizer=tf.keras.optimizers.SGD(learning_rate=args.learning_rate), loss=tf.keras.losses.MeanAbsoluteError(), metrics=[RSE, RMSE])
+    
 
     # model_history = []
     # Fit model
-    history = model.fit(data.train_set[0], data.train_set[1], epochs=args.epochs, batch_size=args.batch_size, validation_data=(data.val_set[0], data.val_set[1]),verbose=2)
+    history = model.fit(data.train_set[0], data.train_set[1], epochs=args.epochs, batch_size=args.batch_size, validation_data=(data.val_set[0], data.val_set[1]))
     # model_history.append(history)
     print(model.summary())
     tf.keras.utils.plot_model(model, to_file='model.png', show_shapes=True)
 
     # Plot loss of training and validation sets
-    plt.plot(history.history['loss'])
-    plt.plot(history.history['val_loss'])
-    plt.title('Baseline Configuration')
-    plt.ylabel('Loss')
+    plt.plot(history.history['RSE'])
+    plt.plot(history.history['val_RSE'])
+    plt.title('')
+    plt.ylabel('Root Square Error')
     plt.xlabel('Epoch')
     plt.legend(['Training','Validation'])
     plt.show()
