@@ -1,13 +1,22 @@
 
 # Import libraries
+# Import libraries
 import numpy as np
 import pandas as pd
+import argparse
+import random
 import matplotlib.pyplot as plt
 import tensorflow as tf
 from tensorflow.keras import backend as K
 from tensorflow.keras.models import Model
-from tensorflow.keras.layers import Input, Conv2D, Dense, Flatten, GRU, Dropout, Concatenate, Add
-import argparse
+from tensorflow.keras.layers import InputLayer, Conv1D, Conv2D, Dense, Flatten, GRU, Dropout, Concatenate, Add
+from keras.models import load_model
+
+# Set seeds
+tf.random.set_seed(123)
+random.seed(123)
+np.random.seed(123)
+
 
 ### Default arguments from original Pytorch implementation--------------------------------------
 parser = argparse.ArgumentParser(description='Tensorflow Time series forecasting')
@@ -49,179 +58,98 @@ parser.add_argument('--L1Loss', type=bool, default=True)
 parser.add_argument('--normalize', type=int, default=2)
 parser.add_argument('--output_fun', type=str, default='sigmoid')
 args = parser.parse_args()
-###-----------------------------------------------------------------------------------
-### Layers to transform data for skipGRU
-###-----------------------------------------------------------------------------------
 
-class PreSkipTrans(tf.keras.layers.Layer):
-    def __init__(self, pt, skip, **kwargs):
-        #
-        # pt:   Number of different RNN cells = (window / skip)
-        # skip: Number of points to skip
-        #
-        self.pt   = int(pt)
-        self.skip = int(skip)
-        super(PreSkipTrans, self).__init__(**kwargs)
-        
-    def build(self, input_shape):
-        super(PreSkipTrans, self).build(input_shape)
-    
-    def call(self, inputs):
-        # Get input tensors; in this case it's just one tensor
-        x = inputs
-
-        # Get the batchsize which is tf.shape(x)[0] since inputs is either X or C which has the same
-        # batchsize as the input to the model
-        batchsize = tf.shape(x)[0]
-        
-
-        # Get the shape of the input data
-        input_shape = K.int_shape(x)
-        
-        # Create output data by taking a 'window' size from the end of input (:-self.pt * self.skip)
-        output = x[:,-self.pt * self.skip:,:]
-        
-        # Reshape the output tensor by:
-        # - Changing first dimension (batchsize) from None to the current batchsize
-        # - Splitting second dimension into 2 dimensions
-        output = tf.reshape(output, [batchsize, self.pt, self.skip, input_shape[2]])
-
-
-        # Permutate axis 1 and axis 2
-        output = tf.transpose(output, perm=[0, 2, 1, 3])
-        
-        # Reshape by merging axis 0 and 1 now hence changing the batch size
-        # to be equal to current batchsize * skip.
-        # This way the time dimension will only contain 'pt' entries which are
-        # just values that were originally 'skip' apart from each other => hence skip RNN ready
-        output = tf.reshape(output, [batchsize * self.skip, self.pt, input_shape[2]])
-        
-        # Adjust the output shape by setting back the batch size dimension to None
-        output_shape = tf.TensorShape([None]).concatenate(output.get_shape()[1:])
-        
-        
-
-        return output
-    
-    def compute_output_shape(self, input_shape):
-        # Since the batch size is None and dimension on axis=2 has not changed,
-        # all we need to do is set shape[1] = pt in order to compute the output shape
-        shape = tf.TensorShape(input_shape).as_list()
-        shape[1] = self.pt
-        
-        return tf.TensorShape(shape)
-
-class PostSkipTrans(tf.keras.layers.Layer):
-    def __init__(self, skip, **kwargs):
-        #
-        # skip: Number of points to skip
-        #
-        self.skip = skip
-        super(PostSkipTrans, self).__init__(**kwargs)
-    
-    def build(self, input_shape):
-        super(PostSkipTrans, self).build(input_shape)
-    
-    def call(self, inputs):
-        # Get input tensors
-	# - First one is the output of the SkipRNN layer which we will operate on
-	# - The second is the oiriginal model input tensor which we will use to get
-	#   the original batchsize
-        x, batchsize = inputs
-
-        # Get the shape of the input data
-        input_shape = K.int_shape(x)
-
-        # Split the batch size into the original batch size before PreTrans and 'Skip'
-        output = tf.reshape(x, [batchsize, self.skip, input_shape[1]])
-        
-        # Merge the 'skip' with axis=1
-        output = tf.reshape(output, [batchsize, self.skip * input_shape[1]])
-        
-        # Adjust the output shape by setting back the batch size dimension to None
-        output_shape = tf.TensorShape([None]).concatenate(output.get_shape()[1:])
-
-        return output
-    
-    def compute_output_shape(self, input_shape):
-        # Adjust shape[1] to be equal to shape[1] * skip in order for the 
-        # shape to reflect the transformation that was done
-        shape = tf.TensorShape(input_shape).as_list()
-        shape[1] = self.skip * shape[1]
-        
-        return tf.TransformShape(shape)
-
-###---------------------------------------------------------------------------
 class PreCNNReshape(tf.keras.layers.Layer):
-    def __init__(self):
-        super(PreCNNReshape, self).__init__()
-      
-    def build(self, input_shape):
-        super(PreCNNReshape, self).build(input_shape)
-      
-    def call(self, inputs):
-        input_shape = K.int_shape(inputs)
-        result = tf.reshape(inputs, [-1,input_shape[1],input_shape[2],1])
-        return result
+  def __init__(self, batchsize):
+    super(PreCNNReshape, self).__init__()
+    self.batchsize=batchsize
+    
+  def build(self, input_shape):
+    super(PreCNNReshape, self).build(input_shape)
+    
+  def call(self, inputs):
+    inputshape = K.int_shape(inputs)
+    result = tf.reshape(inputs, [-1,inputshape[1],inputshape[2],1])
+    return result
 
 class PostCNNReshape(tf.keras.layers.Layer):
-    def __init__(self):
-        super(PostCNNReshape, self).__init__()
-      
-    def build(self, input_shape):
-        super(PostCNNReshape, self).build(input_shape)
-      
-    def call(self, inputs):
-        result = tf.squeeze(inputs,axis=2)
-        return result
+  def __init__(self):
+    super(PostCNNReshape, self).__init__()
+    
+  def build(self, input_shape):
+    super(PostCNNReshape, self).build(input_shape)
+    
+  def call(self, inputs):
+    result = tf.squeeze(inputs,axis=2)
+    return result
 
-
-class PreARReshape(tf.keras.layers.Layer):
-    def __init__(self, highway):
-        self.hw = int(highway)
-        super(PreARReshape, self).__init__()
+class PreSkipGRUReshape(tf.keras.layers.Layer):
+  def __init__(self, pt, skip):
+    super(PreSkipGRUReshape, self).__init__()
+    self.pt   = int(pt)
+    self.skip = int(skip)
       
-    def build(self, input_shape):
-        super(PreARReshape, self).build(input_shape)
-      
-    def call(self, inputs):
-        inputs, inputshape = inputs
-        # print("Initial Input shape:",self.inputshape)
-        # print("Batchsize:",self.inputshape[0])
-        # print("Input shape:",input_shape)
-        out = inputs[:,-self.hw:,:]
-        out = tf.transpose(out,perm=[0,2,1])
-        result = tf.reshape(out,[inputshape[0]*K.int_shape(inputs)[2],self.hw])
-        return result
+  def build(self, input_shape):
+    super(PreSkipGRUReshape, self).build(input_shape)
+  
+  def call(self, inputs):
+    batchsize = tf.shape(inputs)[0]
+    inputshape = K.int_shape(inputs)
+    out = inputs[:,-self.pt * self.skip:,:]
+    out = tf.reshape(out, [batchsize, self.pt, self.skip, inputshape[2]])
+    out = tf.transpose(out, perm=[0,2,1,3])
+    result = tf.reshape(out, [batchsize * self.skip, self.pt, inputshape[2]])
+    return result
 
-    # def compute_output_shape(self, input_shape):
-    #     out_shape = tf.TensorShape.as_list(input_shape)
-    #     out_shape[1] = self.hw
-    #     return tf.TensorShape(shape)
+class PostSkipGRUReshape(tf.keras.layers.Layer):
+  def __init__(self, skip):
+    super(PostSkipGRUReshape, self).__init__()
+    self.skip = skip
 
-class PostARReshape(tf.keras.layers.Layer):
-    def __init__(self, m):
-      self.m = m
-      super(PostARReshape, self).__init__()
-      
-    def build(self, input_shape):
-      super(PostARReshape, self).build(input_shape)
-      
-    def call(self, inputs):
-      inputs, inputshape = inputs
-      result = tf.reshape(inputs, [inputshape[0], self.m])
-      return result
+  def build(self, input_shape):
+    super(PostSkipGRUReshape, self).build(input_shape)
 
-    # def compute_output_shape(self, input_shape):
-    #   out_shape = tf.TensorShape.as_list(input_shape)
-    #   out_shape[1] = self.m
-    #   return tf.TensorShape(out_shape)
+  def call(self, inputs):
+    input = inputs
+    inputshape = K.int_shape(input)
+    out = tf.reshape(input, [-1, self.skip, inputshape[1]])
+    result = tf.reshape(out, [-1, self.skip * inputshape[1]])
+    return result
+
+class PreAutoRegReshape(tf.keras.layers.Layer):
+  def __init__(self, highway):
+    super(PreAutoRegReshape, self).__init__()
+    self.hw = int(highway)
+    
+  def build(self, input_shape):
+    super(PreAutoRegReshape, self).build(input_shape)
+    
+  def call(self, inputs):
+    inputs, inputshape = inputs
+    out = inputs[:,-self.hw:,:]
+    out = tf.transpose(out,perm=[0,2,1])
+    result = tf.reshape(out,[inputshape[0]*K.int_shape(inputs)[2],self.hw])
+    return result
+
+class PostAutoRegReshape(tf.keras.layers.Layer):
+  def __init__(self, m):
+    super(PostAutoRegReshape, self).__init__()
+    self.m = m
+    
+  def build(self, input_shape):
+    super(PostAutoRegReshape, self).build(input_shape)
+    
+  def call(self, inputs):
+    inputs, inputshape = inputs
+    result = tf.reshape(inputs, [inputshape[0], self.m])
+    return result
 
 class Model(tf.keras.Model):
 
-  def __init__(self, args, in_shape):
+  def __init__(self, args, in_shape, dilation):
     super(Model, self).__init__()
     self.m = in_shape[2]
+    self.dilation = dilation
     self.batchsize = args.batch_size
     self.window = args.window
     self.hidRNN = args.hidRNN
@@ -232,35 +160,43 @@ class Model(tf.keras.Model):
     self.pt = (self.window - self.CNN_kernel)/self.skip
     self.hw = args.highway_window
     self.inputshape = in_shape
-    self.reshape1 = PreCNNReshape()
-    self.conv1 = Conv2D(self.hidCNN, kernel_size = (self.CNN_kernel, self.m))
-    self.relu1 = tf.keras.layers.ReLU()
-    self.dropout1 = Dropout(rate = args.dropout)
+    self.input1 = InputLayer(input_shape=in_shape[1:], batch_size=self.batchsize)
+    self.reshape1 = PreCNNReshape(self.batchsize)
+    self.dilconv1 = Conv2D(self.hidCNN, kernel_size = (int(self.CNN_kernel), int(self.m//2)), dilation_rate=dilation, padding="same", activation="relu")
+    self.conv1 = Conv2D(self.hidCNN, kernel_size = (self.CNN_kernel, self.m), activation="relu")
     self.reshape2 = PostCNNReshape()
+    self.reshape3 = PreSkipGRUReshape(self.pt, int((self.window - self.CNN_kernel + 1) / self.pt))
+    self.dropout1 = Dropout(rate = args.dropout)
     self.gru1 = GRU(self.hidRNN, activation="relu", return_sequences = False, return_state = True)
     self.dropout2 = Dropout(rate = args.dropout)
     if (self.skip > 0):
-        self.preskiptrans = PreSkipTrans(self.pt, int((self.window - self.CNN_kernel + 1) / self.pt))
         self.GRUskip = GRU(self.hidSkip, activation="relu", return_sequences = False, return_state = True)
         self.linear1 = Dense(self.m)
-        self.postskiptrans = PostSkipTrans(int((self.window - self.CNN_kernel + 1) / self.pt))
+        self.reshape4 = PostSkipGRUReshape(int((self.window - self.CNN_kernel + 1) / self.pt))
     else:
         self.linear1 = Dense(self.m)
     if (self.hw > 0):
-        self.prearreshape = PreARReshape(self.hw)
+        self.reshape5 = PreAutoRegReshape(self.hw)
         self.highway1 = Flatten()
         self.highway2 = Dense(1)
-        self.postarreshape = PostARReshape(self.m)
+        self.reshape6 = PostAutoRegReshape(self.m)
     self.concat = Concatenate(axis=1)
     self.flatten = Flatten()
     self.dense_final = Dense(self.m)
     self.sum = Add()
 
   def call(self, inputs):
+
+    # Input layer
+    first = self.input1(inputs)
+
     # CNN layer
-    init = self.reshape1(inputs)
-    conv = self.conv1(init)
-    conv = self.relu1(conv)
+    init = self.reshape1(first)
+    if self.dilation >= 2:
+      conv = self.dilconv1(init)
+      conv = self.conv1(conv)
+    else:
+      conv = self.conv1(init)
     conv = self.dropout1(conv)
     conv = self.reshape2(conv)
 
@@ -270,9 +206,9 @@ class Model(tf.keras.Model):
 
     # SkipGRU layer with Relu activation function
     if self.skip > 0:
-        skipgru = self.preskiptrans(conv)
-        _,skipgru = self.GRUskip(skipgru)
-        skipgru = self.postskiptrans([skipgru,self.batchsize])
+      skipgru = self.reshape3(conv)
+      _,skipgru = self.GRUskip(skipgru)
+      skipgru = self.reshape4(skipgru)
 
     # Concatenate the outputs of GRU and SkipGRU
     r = self.concat([gru,skipgru])
@@ -283,10 +219,10 @@ class Model(tf.keras.Model):
     
     # Highway
     if (self.hw > 0):
-        z = self.prearreshape([inputs, tf.shape(inputs)])
+        z = self.reshape5([inputs, tf.shape(inputs)])
         z = self.highway1(z)
         z = self.highway2(z)
-        z = self.postarreshape([z,tf.shape(inputs)])
+        z = self.reshape6([z,tf.shape(inputs)])
           
     res = self.sum([res,z])
 
@@ -328,47 +264,78 @@ class data_utility(object):
         self.val_set = set_lst[1]
         self.test_set = set_lst[2]
 
+### Metrics
+# Source: https://github.com/gucoloradoc/AQForecasting/blob/18d4ef8084adcdbf36903d13bdc6515aec13b00b/Monterrey/ANN_output/27-06-2019_22-41-43/new_generator.py
 def RSE(y_true, y_pred):
-    sq_error = K.square(y_true - y_pred)
-    mse = K.mean(sq_error)
-    RSE = K.sqrt(mse)/K.std(y_true)
+    RSE = K.sqrt(K.sum(K.square(y_pred-y_true)))
     return RSE
 
-RMSE = tf.keras.metrics.RootMeanSquaredError()
+# Source: https://github.com/WenYanger/Keras_Metrics/blob/master/PearsonCorr.py
+def pearson_r(y_true, y_pred):
+    x = y_true
+    y = y_pred
+    mx = K.mean(x, axis=0)
+    my = K.mean(y, axis=0)
+    xm, ym = x - mx, y - my
+    r_num = K.sum(xm * ym)
+    x_square_sum = K.sum(xm * xm)
+    y_square_sum = K.sum(ym * ym)
+    r_den = K.sqrt(x_square_sum * y_square_sum)
+    r = r_num / r_den
+    return K.mean(r)
     
 
 if __name__ == "__main__":
     ### Traffic data
-    ### A collection of 48 months (2015-2016) hourly data from the California Department
+    ### A collection of 24 months (2015-2016) hourly data from the California Department
     ### of Transportation. The data describes the road occupancy rates (between 0 and 1) 
-    ### measured by different sensors on San Francisco Bay area freeways.
-    window = 24*7
-    horizon = 24
-    #fileloc = "/Users/danielpetterson/GitHub/LSTnet-Tensorflow-Implementation/data/traffic/traffic.txt"
-    fileloc = "/Users/danielpetterson/GitHub/LSTnet-Tensorflow-Implementation/data/energy_dataset.csv"
-    data = data_utility(fileloc,0.01,0.01,horizon,window,True)
+    ### measured by different sensors on San Francisco Bay area freeways. This dataset uses
+    ### data from the first 25 sensors of the original dataset that can be found here:
+    ### 
 
-    model = Model(args, data.train_set[0].shape)
+    path = "https://danielpetterson.github.io/assets/traffic.csv"
 
-    ## Use SGD as optimiser in place of Adam due to issues with tensorflow_macos
-    model.compile(optimizer=tf.keras.optimizers.SGD(learning_rate=args.learning_rate), loss=tf.keras.losses.MeanAbsoluteError(), metrics=[RSE, RMSE])
-    
+    def eval(data_path, args, dilation, horizon, save_loc):
+        data = data_utility(data_path, 0.6 ,0.2,horizon=horizon,window=24*7, header=True)
+        # Instantiate
+        model = Model(args, data.train_set[0].shape, dilation=dilation)
+        # Compile
+        model.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=args.learning_rate),
+                        loss=tf.keras.losses.MeanAbsoluteError(), metrics=[RSE, pearson_r])
+        
+        checkpoint_filepath = save_loc
+        model_checkpoint_callback = tf.keras.callbacks.ModelCheckpoint(
+            filepath=checkpoint_filepath,
+            save_weights_only=True,
+            mode='max',
+            save_best_only=True)
+        
+        # Fit model
+        history = model.fit(data.train_set[0], data.train_set[1],
+                            epochs=args.epochs, batch_size=args.batch_size, 
+                            validation_data=(data.val_set[0], data.val_set[1]),
+                            callbacks=[model_checkpoint_callback])
+        
+        # Save architecture and weights
+        model.save(save_loc)
+        score = model.evaluate(data.test_set[0], data.test_set[1], verbose = 0) 
+        print(score)
 
-    # model_history = []
-    # Fit model
-    history = model.fit(data.train_set[0], data.train_set[1], epochs=args.epochs, batch_size=args.batch_size, validation_data=(data.val_set[0], data.val_set[1]))
-    # model_history.append(history)
-    print(model.summary())
-    tf.keras.utils.plot_model(model, to_file='model.png', show_shapes=True)
+        return history, score
 
-    # Plot loss of training and validation sets
-    plt.plot(history.history['RSE'])
-    plt.plot(history.history['val_RSE'])
-    plt.title('')
-    plt.ylabel('Root Square Error')
-    plt.xlabel('Epoch')
-    plt.legend(['Training','Validation'])
-    plt.show()
+    hist2_12, score2_1 = eval(path, args, 2, 12, '/content/gdrive/MyDrive/model12')
+    hist_12, score1 = eval(path, args, 1, 12, '/content/gdrive/MyDrive/lst12')
+    hist2_24, score2_2 = eval(path, args, 2, 24, '/content/gdrive/MyDrive/model24')
+    hist_24, score1_2 = eval(path, args, 1, 24, '/content/gdrive/MyDrive/lst24')
+
+    # # Plot loss of training and validation sets
+    # plt.plot(history.history['RSE'])
+    # plt.plot(history.history['val_RSE'])
+    # plt.title('')
+    # plt.ylabel('Root Square Error')
+    # plt.xlabel('Epoch')
+    # plt.legend(['Training','Validation'])
+    # plt.show()
 
 
 
